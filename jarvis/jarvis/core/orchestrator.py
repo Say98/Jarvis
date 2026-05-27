@@ -1,4 +1,4 @@
-"""Orchestrator: wires Planner, Reasoner, Executor, MemoryManager."""
+"""Orchestrator: wires every V3 component."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,13 +8,14 @@ from jarvis.core.agent import Agent
 from jarvis.core.context import ContextManager
 from jarvis.core.executor import Executor
 from jarvis.core.planner import Planner
+from jarvis.core.policy_engine import ExecutionPolicyEngine, PolicyConfig
 from jarvis.core.reasoner import Reasoner
 from jarvis.llm.registry import build_provider
 from jarvis.logging_setup import get_logger, setup_logging
 from jarvis.memory.classifier import MemoryClassifier
 from jarvis.memory.manager import MemoryManager
 from jarvis.safety.approver import Approver, AutoApprover, CLIApprover
-from jarvis.safety.policy import PolicyEngine
+from jarvis.safety.policy import PolicyEngine as SafetyPolicyEngine
 from jarvis.tools.registry import ToolRegistry, build_default_registry
 
 log = get_logger(__name__)
@@ -43,8 +44,8 @@ class Orchestrator:
             session_id=session_id,
         )
 
-        policy = PolicyEngine(self.settings.safety)
-        self.approver: Approver = approver or CLIApprover(policy=policy)
+        safety_policy = SafetyPolicyEngine(self.settings.safety)
+        self.approver: Approver = approver or CLIApprover(policy=safety_policy)
 
         context = ContextManager(
             max_tokens=self.settings.agent.context_max_tokens,
@@ -56,20 +57,32 @@ class Orchestrator:
         self.executor = Executor(
             self.tools,
             self.approver,
-            max_consecutive_failures=self.settings.agent.max_consecutive_failures,
+            max_retries_per_call=self.settings.agent.tool_retry,
+        )
+
+        self.policy = ExecutionPolicyEngine(
+            PolicyConfig(
+                max_consecutive_failures=self.settings.agent.max_consecutive_failures,
+                max_total_failures=self.settings.agent.max_total_failures,
+                max_replans=self.settings.agent.max_replans,
+                ban_tool_after_failures=self.settings.agent.ban_tool_after_failures,
+                same_tool_loop_window=self.settings.agent.same_tool_loop_window,
+                max_step_attempts=self.settings.agent.max_step_attempts,
+                persistent_ban_threshold=self.settings.agent.persistent_ban_threshold,
+            )
         )
 
         self.agent = Agent(
             planner=self.planner,
             reasoner=self.reasoner,
             executor=self.executor,
+            policy=self.policy,
             memory=self.memory,
             max_steps=self.settings.agent.max_steps,
             retrieve_k=self.settings.agent.retrieve_k,
-            replan_after_failures=self.settings.agent.replan_after_failures,
         )
         log.info(
-            "Jarvis v2 ready: model=%s tools=%s session=%s",
+            "Jarvis V3 ready: model=%s tools=%s session=%s",
             self.settings.llm.model,
             self.tools.names(),
             self.memory.session_id,

@@ -1,4 +1,4 @@
-"""Example: run a single objective through Jarvis v2 and stream events."""
+"""V3 example: run a non-trivial task and stream every event."""
 from jarvis.core.orchestrator import Orchestrator
 from jarvis.core.schemas import AgentStep, FinalAnswer, Plan
 
@@ -16,10 +16,19 @@ def main() -> None:
         if isinstance(event, Plan):
             print(f"\n=== PLAN rev {event.revision} ===")
             for s in event.steps:
-                print(f"  {s.id}. [{s.status}] {s.goal} (tool={s.suggested_tool})")
+                deps = f" deps={s.depends_on}" if s.depends_on else ""
+                print(
+                    f"  {s.id}. [{s.status}] {s.goal}"
+                    f" (tool={s.suggested_tool}, expects={s.expected_output}){deps}"
+                )
         elif isinstance(event, AgentStep):
-            print(f"\n[step {event.step}/plan_step={event.plan_step_id}] {event.action.type}")
+            print(
+                f"\n[step {event.step}/plan_step={event.plan_step_id}] "
+                f"{event.action.type}"
+            )
             print(f"  thought: {event.thought.reasoning}")
+            if event.action.reason:
+                print(f"  reason:  {event.action.reason}")
             if event.action.tool_call:
                 print(f"  tool: {event.action.tool_call.tool}")
                 print(f"  args: {event.action.tool_call.arguments}")

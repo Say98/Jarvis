@@ -35,8 +35,17 @@ class MemoryConfig(BaseModel):
 class AgentConfig(BaseModel):
     max_steps: int = 12
     retrieve_k: int = 5
+    # Execution policy thresholds
     max_consecutive_failures: int = 3
-    replan_after_failures: int = 2
+    max_total_failures: int = 8
+    max_replans: int = 2
+    ban_tool_after_failures: int = 2
+    same_tool_loop_window: int = 3
+    max_step_attempts: int = 5
+    persistent_ban_threshold: int = 4
+    # Tooling
+    tool_retry: int = 1
+    # Context
     context_max_tokens: int = 6000
     context_keep_recent: int = 6
 

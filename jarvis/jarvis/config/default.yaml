@@ -22,7 +22,13 @@ agent:
   max_steps: 12
   retrieve_k: 5
   max_consecutive_failures: 3
-  replan_after_failures: 2
+  max_total_failures: 8
+  max_replans: 2
+  ban_tool_after_failures: 2
+  same_tool_loop_window: 3
+  max_step_attempts: 5
+  persistent_ban_threshold: 4
+  tool_retry: 1
   context_max_tokens: 6000
   context_keep_recent: 6
 

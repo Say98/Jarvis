@@ -21,17 +21,22 @@ def render_tools(tools: list[Tool]) -> str:
 
 PLANNER_SYSTEM = dedent(
     """\
-    You are the PLANNER of a tool-using AI agent.
+    You are the PLANNER of a tool-using autonomous AI agent.
 
-    Given a user objective, produce a short, ordered, actionable plan that the
-    EXECUTOR will follow step-by-step using the available tools.
+    Given a user objective, produce a SHORT, ORDERED, EXECUTABLE plan.
 
-    Guidelines:
-    - Keep plans concise (3-7 steps typical). Do NOT pad with trivial steps.
-    - Each step must have ONE clear goal expressible in a single sentence.
-    - Prefer existing tools; pick suggested_tool from the list when helpful.
-    - The final step must produce or summarize the answer for the user.
-    - If the objective is trivial (e.g. a factual question), emit a single step.
+    Each step must declare:
+      - "goal"            : one-sentence objective for the step
+      - "suggested_tool"  : a tool name from the available list (or null)
+      - "success_criteria": observable outcome that proves the step succeeded
+      - "expected_output" : what the next step needs from this one
+      - "depends_on"      : list of step ids (1-based) this step requires
+
+    Rules:
+    - Keep plans concise (3-7 steps typical).
+    - Use dependencies for real ordering only — they form a DAG.
+    - Prefer existing tools; never invent unavailable ones.
+    - The FINAL step must produce or summarize the answer for the user.
 
     Available tools:
     {tools_block}
@@ -56,9 +61,18 @@ def planner_user_prompt(objective: str, memory_snippets: list[str]) -> str:
 
 REPLAN_SYSTEM = dedent(
     """\
-    You are the PLANNER. The current plan has stalled or a step has failed.
-    Produce a REVISED plan that addresses the failure and completes the objective.
-    Keep steps that already succeeded; remove or rework failing ones.
+    You are the PLANNER. The current plan has stalled or failed.
+    Produce a REVISED plan that recovers and completes the objective.
+
+    Guidelines:
+    - PRESERVE work already done: the COMPLETED STEPS list is authoritative;
+      do not re-do them. Build the new plan as the remaining work only.
+    - Avoid repeating known-failed tool/argument combinations (see HISTORY).
+    - Respect the BANNED TOOLS list (per step AND persistent).
+    - If a step in FAILED STEPS proved infeasible as written, change the
+      approach — different tool, different decomposition, or skip it.
+    - Each step must declare goal / suggested_tool / success_criteria /
+      expected_output / depends_on (DAG, 1-based ids restarting at 1).
 
     Available tools:
     {tools_block}
@@ -67,20 +81,42 @@ REPLAN_SYSTEM = dedent(
 
 
 def replan_user_prompt(
-    objective: str, current_plan_json: str, scratchpad_json: str
+    objective: str,
+    current_plan_json: str,
+    completed_steps_json: str,
+    failed_steps_json: str,
+    history_json: str,
+    signals_json: str,
+    banned_json: str,
+    persistent_bans_json: str,
 ) -> str:
     return dedent(
         f"""\
         OBJECTIVE:
         {objective}
 
-        CURRENT PLAN (with status):
+        CURRENT PLAN (with status / attempts):
         {current_plan_json}
 
-        EXECUTION TRACE:
-        {scratchpad_json}
+        COMPLETED STEPS (do NOT redo these):
+        {completed_steps_json}
 
-        Produce a revised plan as JSON.
+        FAILED STEPS (do NOT retry the same approach):
+        {failed_steps_json}
+
+        EXECUTION HISTORY:
+        {history_json}
+
+        TASK SIGNALS:
+        {signals_json}
+
+        BANNED TOOLS PER STEP:
+        {banned_json}
+
+        PERSISTENT BANNED TOOLS (whole task):
+        {persistent_bans_json}
+
+        Produce a revised plan as JSON. Number the new steps starting at 1.
         """
     )
 
@@ -89,23 +125,31 @@ def replan_user_prompt(
 
 REASONER_SYSTEM = dedent(
     """\
-    You are the REASONER of a tool-using AI agent.
+    You are the REASONER of an autonomous AI agent.
 
-    You receive: the user objective, the current PLAN STEP you must complete,
-    the execution scratchpad so far, and the available tools.
+    You receive: the user objective, the CURRENT PLAN STEP (including its
+    expected_output and success_criteria), the execution history, current
+    task signals, and the available tools.
 
-    Decide the SINGLE NEXT action. Options:
+    Decide the SINGLE NEXT action. Allowed action types:
 
       1) "tool_call"     – invoke a tool with structured arguments.
-      2) "step_complete" – the current plan step is achieved; agent moves on.
-      3) "final_answer"  – the WHOLE objective is done; return the user-facing answer.
+      2) "step_complete" – the CURRENT step's success_criteria is satisfied
+                           by prior observations; agent moves on.
+      3) "final_answer"  – the WHOLE objective is done; emit the user answer.
+      4) "replan"        – the current plan is no longer viable; trigger replan.
+      5) "abort"         – the task is impossible or unsafe; stop with reason.
 
-    Rules:
+    Hard rules:
     - Output JSON only, matching the required schema. No prose, no markdown.
-    - Inspect the scratchpad to avoid repeating failed or redundant calls.
-    - Use the most specific tool. Never invent tools not listed.
+    - NEVER invoke tools listed under BANNED_TOOLS for the current step.
+    - The current step is DONE only when its expected_output / success_criteria
+      is supported by the EXECUTION HISTORY. If yes → "step_complete".
+    - Do not call tools redundantly; inspect history first.
+    - Prefer "replan" over "abort"; reserve "abort" for truly impossible tasks.
+    - Only emit "final_answer" when the WHOLE OBJECTIVE is complete.
     - Keep 'thought' concise (1-3 sentences).
-    - Only emit 'final_answer' when the OBJECTIVE — not just the step — is complete.
+    - Always set action.reason for replan or abort.
 
     Available tools:
     {tools_block}
@@ -116,20 +160,32 @@ REASONER_SYSTEM = dedent(
 def reasoner_user_prompt(
     objective: str,
     current_step_json: str,
-    scratchpad_json: str,
+    completed_steps_json: str,
+    history_json: str,
+    signals_json: str,
+    banned_tools: list[str],
     memory_snippets: list[str],
 ) -> str:
     mem = "\n".join(f"- {m}" for m in memory_snippets) if memory_snippets else "(none)"
+    banned = ", ".join(banned_tools) if banned_tools else "(none)"
     return dedent(
         f"""\
         OBJECTIVE:
         {objective}
 
-        CURRENT PLAN STEP:
+        CURRENT PLAN STEP (focus on its success_criteria + expected_output):
         {current_step_json}
 
-        SCRATCHPAD (prior steps):
-        {scratchpad_json}
+        COMPLETED STEPS (already satisfied):
+        {completed_steps_json}
+
+        BANNED_TOOLS for this step: {banned}
+
+        TASK SIGNALS:
+        {signals_json}
+
+        EXECUTION HISTORY:
+        {history_json}
 
         RELEVANT MEMORY:
         {mem}

@@ -25,12 +25,19 @@ class ToolCall(BaseModel):
 
 
 class Action(BaseModel):
-    """Either call a tool, mark current plan-step done, or finish task."""
+    """All possible agent actions emitted by the Reasoner."""
 
-    type: Literal["tool_call", "step_complete", "final_answer"]
+    type: Literal[
+        "tool_call",
+        "step_complete",
+        "final_answer",
+        "replan",
+        "abort",
+    ]
     tool_call: ToolCall | None = None
     final_answer: str | None = None
     note: str | None = None
+    reason: str | None = None
 
 
 class Thought(BaseModel):
@@ -68,8 +75,11 @@ class PlanStep(BaseModel):
     goal: str
     suggested_tool: str | None = None
     success_criteria: str | None = None
+    expected_output: str | None = None
+    depends_on: list[int] = Field(default_factory=list)
     status: Literal["pending", "in_progress", "done", "failed", "skipped"] = "pending"
     notes: str | None = None
+    attempts: int = 0
 
 
 class Plan(BaseModel):
@@ -77,22 +87,46 @@ class Plan(BaseModel):
     steps: list[PlanStep]
     revision: int = 0
 
-    def current(self) -> PlanStep | None:
+    def _by_id(self, step_id: int) -> PlanStep | None:
         for s in self.steps:
-            if s.status in ("pending", "in_progress"):
+            if s.id == step_id:
+                return s
+        return None
+
+    def _deps_satisfied(self, step: PlanStep) -> bool:
+        for dep_id in step.depends_on:
+            dep = self._by_id(dep_id)
+            if dep is None or dep.status not in ("done", "skipped"):
+                return False
+        return True
+
+    def current(self) -> PlanStep | None:
+        """Return the next ready step (deps satisfied), preferring in_progress."""
+        for s in self.steps:
+            if s.status == "in_progress":
+                return s
+        for s in self.steps:
+            if s.status == "pending" and self._deps_satisfied(s):
                 return s
         return None
 
     def mark(self, step_id: int, status: str, note: str | None = None) -> None:
-        for s in self.steps:
-            if s.id == step_id:
-                s.status = status  # type: ignore[assignment]
-                if note:
-                    s.notes = note
-                return
+        s = self._by_id(step_id)
+        if s is None:
+            return
+        s.status = status  # type: ignore[assignment]
+        if note:
+            s.notes = note
 
     def is_complete(self) -> bool:
         return all(s.status in ("done", "skipped") for s in self.steps)
+
+    def is_stalled(self) -> bool:
+        """True if no step can progress (all blocked / failed)."""
+        for s in self.steps:
+            if s.status in ("pending", "in_progress") and self._deps_satisfied(s):
+                return False
+        return not self.is_complete()
 
 
 class PlanDraft(BaseModel):
@@ -154,3 +188,14 @@ class AgentStep(BaseModel):
 
 
 AgentEvent = Union[Plan, AgentStep, FinalAnswer]
+
+
+# --- policy ----------------------------------------------------------------
+
+
+class PolicyVerdict(BaseModel):
+    """Deterministic decision emitted by the ExecutionPolicyEngine."""
+
+    kind: Literal["continue", "replan", "abort"]
+    reason: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)

@@ -9,11 +9,13 @@ from jarvis.core.schemas import (
     Observation,
     Plan,
     PlanStep,
+    PolicyVerdict,
     ReasonerDecision,
     ScratchpadEntry,
     Thought,
     ToolCall,
 )
+from jarvis.core.task_state import TaskState, make_state
 
 __all__ = [
     "Action",
@@ -26,8 +28,11 @@ __all__ = [
     "Observation",
     "Plan",
     "PlanStep",
+    "PolicyVerdict",
     "ReasonerDecision",
     "ScratchpadEntry",
+    "TaskState",
     "Thought",
     "ToolCall",
+    "make_state",
 ]

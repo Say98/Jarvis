@@ -1,90 +1,163 @@
-# Jarvis – Local AI Assistant
+# Jarvis V3 – Production-grade Local AI Agent
 
-Jarvis is a fully local, model-agnostic AI agent framework. It is **not** a chatbot.
-It is a tool-using agent with persistent memory and a human-in-the-loop safety layer.
+Jarvis is a fully local, model-agnostic **autonomous AI agent**. Not a chatbot.
 
-## Features
+V3 introduces a `TaskState`-centric loop, a deterministic `ExecutionPolicyEngine`,
+and an upgraded Reasoner that can explicitly choose to **replan** or **abort**.
 
-- **Modular architecture**: strict separation of `core`, `llm`, `tools`, `memory`, `safety`, `api`.
-- **Model-agnostic LLM interface**: Ollama provider included; vLLM/OpenAI pluggable.
-- **Real agent loop**: `THINK → DECIDE → ACT → OBSERVE → STORE`.
-- **Structured actions** via Pydantic – no string parsing hacks.
-- **Working tools**: shell, filesystem, sandboxed Python execution.
-- **Memory**:
-  - Short-term conversational buffer
-  - Long-term vector memory (ChromaDB + sentence-transformers)
-  - Persistent SQLite event store
-- **Safety layer**: per-action policies (`auto`, `ask`, `double_confirm`).
-- **Interfaces**: CLI (Typer + Rich) and FastAPI HTTP server.
+## Architecture
 
-## Requirements
+```
+                        ┌──────────────────────────┐
+                        │       TaskState          │
+                        │  objective, plan,        │
+                        │  history, failures,      │
+                        │  signals, banned_tools   │
+                        └─────────────┬────────────┘
+                                      │
+                ┌─────────────────────┼─────────────────────┐
+                ▼                     ▼                     ▼
+          Planner               PolicyEngine            Reasoner
+       (DAG of steps,       (deterministic rules:     (LLM, 5 actions:
+        depends_on,          replan / abort /          tool_call,
+        expected_output)     continue)                 step_complete,
+                                                       replan, abort,
+                                                       final_answer)
+                                      │
+                                      ▼
+                                  Executor
+                              (retry on read/execute,
+                               size limits, timing)
+                                      │
+                                      ▼
+                              MemoryManager
+                          (typed + LLM-filtered)
+```
 
-- Python 3.10+
-- [Ollama](https://ollama.com) running locally (e.g. `ollama serve` with `llama3` pulled).
-- Optional GPU for the embedding model.
+## V3 changes vs V2
 
-## Install
+| Area | V3 upgrade |
+|---|---|
+| **State** | New [`TaskState`](jarvis/jarvis/core/task_state.py) — single source of truth: plan, history, failures, banned_tools_for_step, signals. |
+| **Loop** | [`Agent`](jarvis/jarvis/core/agent.py) is a thin coordinator over `TaskState`; all intelligence in Planner/Reasoner, all hard rules in PolicyEngine. |
+| **Reasoner** | Can emit `tool_call`, `step_complete`, `final_answer`, **`replan`**, **`abort`**. Banned-tool defense converts illegal picks into `replan`. |
+| **PolicyEngine** | New deterministic [`ExecutionPolicyEngine`](jarvis/jarvis/core/policy_engine.py): `before()` returns `continue / replan / abort`; `after()` updates tool-failure counters and bans tools per step. |
+| **Planner** | Steps carry `depends_on`, `expected_output`. `Plan.current()` respects deps; `Plan.is_stalled()` triggers replan. Replan receives banned-tools, signals, full history. |
+| **Executor** | Per-call retry for `read`/`execute` classes (never for `write`/`destructive`); attempts + elapsed_s in metadata; permission/validation errors are not retried. |
+| **Memory** | Typed (`fact`/`preference`/`task_result`/`skill`) with LLM-backed [`MemoryClassifier`](jarvis/jarvis/memory/classifier.py) gate. |
+| **LLM** | `generate_json(schema)` with retry-on-validation; Ollama `format: json`. |
+| **Context** | Token-budgeted message trimming. |
+
+## Strict Reasoner output schema
+
+```json
+{
+  "thought": "...",
+  "action": {
+    "type": "tool_call | step_complete | final_answer | replan | abort",
+    "tool_call":   { "tool": "...", "arguments": { ... } },
+    "final_answer": "...",
+    "note":   "...",
+    "reason": "..."
+  }
+}
+```
+
+Pydantic-validated; non-conforming output is retried up to N times with the
+validation error fed back to the model.
+
+## Loop pseudocode (exact)
+
+```
+state = TaskState(objective)
+state.plan = Planner.plan(objective, memory)
+while step_budget left:
+    verdict = PolicyEngine.before(state)
+    if verdict == "abort":  yield FinalAnswer(reason); return
+    if verdict == "replan": state.plan = Planner.replan(state); continue
+    step = state.current_step()
+    if step is None: yield synthesized FinalAnswer; return
+    decision = Reasoner.decide(state, memory)
+    match decision.action.type:
+        tool_call     → obs = Executor.execute(...); PolicyEngine.after(state, tool, obs)
+        step_complete → plan.mark(step, "done")
+        replan        → state.plan = Planner.replan(state)
+        abort         → yield FinalAnswer(reason); return
+        final_answer  → yield FinalAnswer; return
+```
+
+## Install & run
 
 ```bash
 pip install -e .
-# or
-pip install -r requirements.txt
-```
-
-## Run
-
-Pull a model in Ollama first:
-
-```bash
 ollama pull llama3
+jarvis chat -v     # interactive REPL with full step trace + plan table
+jarvis run "..."   # one-shot
+jarvis serve       # FastAPI on :8000
+jarvis tools       # list registered tools
+python examples/basic_usage.py
 ```
 
-Then run Jarvis:
+## Configuration (key V3 fields)
 
-```bash
-jarvis chat
-# or
-python -m jarvis chat
+`jarvis/config/default.yaml` (env override: `JARVIS_*` with `__` for nesting).
+
+```yaml
+agent:
+  max_steps: 12
+  retrieve_k: 5
+  # ExecutionPolicyEngine thresholds
+  max_consecutive_failures: 3
+  max_total_failures: 8
+  max_replans: 2
+  ban_tool_after_failures: 2
+  same_tool_loop_window: 3
+  # Executor
+  tool_retry: 1
+  # Context window
+  context_max_tokens: 6000
+  context_keep_recent: 6
 ```
 
-Run the HTTP API:
+## Safety
 
-```bash
-jarvis serve --host 127.0.0.1 --port 8000
-```
+| Action class | Policy          |
+|--------------|-----------------|
+| read         | auto            |
+| write        | ask             |
+| execute      | ask             |
+| destructive  | double_confirm  |
 
-## Configuration
-
-Edit `jarvis/config/default.yaml` or set environment variables prefixed with `JARVIS_`
-(e.g. `JARVIS_LLM__MODEL=qwen2.5`).
+The `Executor` is the single chokepoint: every tool call passes through the
+`Approver` before running, then through the per-class retry policy.
 
 ## Project layout
 
 ```
 jarvis/
-├── core/         # Agent loop, orchestrator, schemas, prompts
-├── llm/          # LLM provider abstraction (Ollama)
-├── tools/        # Tool interface + shell / fs / python tools
-├── memory/       # Short-term, long-term (Chroma), SQLite store
-├── safety/       # Approval policies + CLI approver
-├── api/          # FastAPI server
-├── config/       # Settings + default.yaml
-├── cli.py        # Typer CLI entry point
-└── logging_setup.py
+├── core/
+│   ├── agent.py            # V3 loop (TaskState + PolicyEngine)
+│   ├── task_state.py       # NEW: central state
+│   ├── policy_engine.py    # NEW: deterministic execution policy
+│   ├── planner.py          # dep-aware plans
+│   ├── reasoner.py         # tool_call/step_complete/final_answer/replan/abort
+│   ├── executor.py         # retry + guards + size limits
+│   ├── context.py          # token budgeting
+│   ├── prompts.py
+│   ├── schemas.py
+│   └── orchestrator.py     # wiring
+├── llm/                    # generate + generate_json + retry
+├── memory/                 # short_term, long_term, store, classifier, manager
+├── safety/                 # approver + safety policy
+├── tools/                  # base + shell/fs/python_exec + file_patch + limits
+├── api/server.py
+├── config/
+└── cli.py
 ```
-
-## Safety
-
-| Action class    | Policy          |
-|-----------------|-----------------|
-| read            | auto            |
-| write           | ask             |
-| execute         | ask             |
-| destructive     | double confirm  |
-
-All tool invocations pass through the safety layer before execution.
 
 ## Extending
 
-- **Add a tool**: subclass `jarvis.tools.base.Tool`, register via `ToolRegistry.register`.
-- **Add an LLM provider**: subclass `jarvis.llm.base.LLMProvider`, register in `llm/registry.py`.
+- **New tool**: subclass `Tool`, implement `_execute`; register in `tools/registry.py`. Wrapper handles error capture, size truncation, normalization.
+- **New LLM provider**: subclass `LLMProvider`, implement `generate`; `generate_json` works out of the box.
+- **New policy rule**: add a check in `ExecutionPolicyEngine.before/after`. It's deterministic Python — no LLM in the loop for safety rails.
+- **New action type**: extend the `Action.type` Literal and handle it in `Agent.stream`.
