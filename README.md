@@ -1,100 +1,120 @@
-# Jarvis v2 – Local AI Agent
+# Jarvis V3 – Production-grade Local AI Agent
 
-Jarvis is a fully local, model-agnostic AI **agent** (not a chatbot) with planning,
-structured reasoning, real tool execution, typed memory, and a safety layer.
+Jarvis is a fully local, model-agnostic **autonomous AI agent**. Not a chatbot.
 
-## What's new in v2
-
-- **Planner / Reasoner / Executor split** – the old monolithic `Agent` is now a
-  thin orchestrator over three single-purpose components.
-- **`generate_json(schema=...)`** on the LLM provider – strict Pydantic-validated
-  output with self-correcting retry. No regex parsing for control flow.
-- **Ollama JSON mode** (`"format": "json"`) used for all structured calls.
-- **Structured scratchpad** – previous steps are stored as typed entries and
-  rebuilt into prompts as a clean JSON array; raw model text is never re-fed.
-- **Typed long-term memory** – every entry has a `MemoryType` (`fact`,
-  `preference`, `task_result`, `skill`); a **MemoryClassifier** decides whether
-  a snippet is worth persisting before it touches Chroma.
-- **Context manager** – token-budgeted trimming of system + recent + relevant
-  messages.
-- **Executor with safety + size limits + failure tracking + replan trigger**.
-- **`file_patch` tool** – targeted, unambiguous search/replace edits.
+V3 introduces a `TaskState`-centric loop, a deterministic `ExecutionPolicyEngine`,
+and an upgraded Reasoner that can explicitly choose to **replan** or **abort**.
 
 ## Architecture
 
 ```
-Agent  (loop orchestrator)
- ├── Planner    → produces a Plan(objective, steps[])
- ├── Reasoner   → per-step ReasonerDecision(thought, action)
- ├── Executor   → safety-checks + runs tool, returns Observation
- └── MemoryManager
-       ├── ShortTermMemory   (deque of ChatMessage)
-       ├── LongTermMemory    (Chroma + sentence-transformers, typed)
-       ├── EventStore        (SQLite: sessions, plans, steps)
-       └── MemoryClassifier  (LLM, decides what to persist)
-
-LLM layer
- ├── LLMProvider.generate()           — raw text
- └── LLMProvider.generate_json(schema)— strict Pydantic with retry
+                        ┌──────────────────────────┐
+                        │       TaskState          │
+                        │  objective, plan,        │
+                        │  history, failures,      │
+                        │  signals, banned_tools   │
+                        └─────────────┬────────────┘
+                                      │
+                ┌─────────────────────┼─────────────────────┐
+                ▼                     ▼                     ▼
+          Planner               PolicyEngine            Reasoner
+       (DAG of steps,       (deterministic rules:     (LLM, 5 actions:
+        depends_on,          replan / abort /          tool_call,
+        expected_output)     continue)                 step_complete,
+                                                       replan, abort,
+                                                       final_answer)
+                                      │
+                                      ▼
+                                  Executor
+                              (retry on read/execute,
+                               size limits, timing)
+                                      │
+                                      ▼
+                              MemoryManager
+                          (typed + LLM-filtered)
 ```
 
-Loop:
-```
-plan = Planner.plan(objective)
-while plan not done and step_budget left:
-    step    = plan.current()
-    decision= Reasoner.decide(step, scratchpad, memory)
-    match decision.action.type:
-        tool_call     → Executor.execute → Observation → scratchpad
-        step_complete → mark step done
-        final_answer  → return
-    if too many failures → Planner.replan(plan, scratchpad)
-```
+## V3 changes vs V2
 
-## Strict LLM output schema (Reasoner)
+| Area | V3 upgrade |
+|---|---|
+| **State** | New [`TaskState`](jarvis/jarvis/core/task_state.py) — single source of truth: plan, history, failures, banned_tools_for_step, signals. |
+| **Loop** | [`Agent`](jarvis/jarvis/core/agent.py) is a thin coordinator over `TaskState`; all intelligence in Planner/Reasoner, all hard rules in PolicyEngine. |
+| **Reasoner** | Can emit `tool_call`, `step_complete`, `final_answer`, **`replan`**, **`abort`**. Banned-tool defense converts illegal picks into `replan`. |
+| **PolicyEngine** | New deterministic [`ExecutionPolicyEngine`](jarvis/jarvis/core/policy_engine.py): `before()` returns `continue / replan / abort`; `after()` updates tool-failure counters and bans tools per step. |
+| **Planner** | Steps carry `depends_on`, `expected_output`. `Plan.current()` respects deps; `Plan.is_stalled()` triggers replan. Replan receives banned-tools, signals, full history. |
+| **Executor** | Per-call retry for `read`/`execute` classes (never for `write`/`destructive`); attempts + elapsed_s in metadata; permission/validation errors are not retried. |
+| **Memory** | Typed (`fact`/`preference`/`task_result`/`skill`) with LLM-backed [`MemoryClassifier`](jarvis/jarvis/memory/classifier.py) gate. |
+| **LLM** | `generate_json(schema)` with retry-on-validation; Ollama `format: json`. |
+| **Context** | Token-budgeted message trimming. |
+
+## Strict Reasoner output schema
 
 ```json
 {
   "thought": "...",
   "action": {
-    "type": "tool_call | step_complete | final_answer",
+    "type": "tool_call | step_complete | final_answer | replan | abort",
     "tool_call":   { "tool": "...", "arguments": { ... } },
     "final_answer": "...",
-    "note": "..."
+    "note":   "...",
+    "reason": "..."
   }
 }
 ```
 
-The Planner emits a `PlanDraft` (objective + step dicts) validated to a `Plan`.
-The MemoryClassifier emits a `MemoryClassification`.
+Pydantic-validated; non-conforming output is retried up to N times with the
+validation error fed back to the model.
 
-## Install
+## Loop pseudocode (exact)
+
+```
+state = TaskState(objective)
+state.plan = Planner.plan(objective, memory)
+while step_budget left:
+    verdict = PolicyEngine.before(state)
+    if verdict == "abort":  yield FinalAnswer(reason); return
+    if verdict == "replan": state.plan = Planner.replan(state); continue
+    step = state.current_step()
+    if step is None: yield synthesized FinalAnswer; return
+    decision = Reasoner.decide(state, memory)
+    match decision.action.type:
+        tool_call     → obs = Executor.execute(...); PolicyEngine.after(state, tool, obs)
+        step_complete → plan.mark(step, "done")
+        replan        → state.plan = Planner.replan(state)
+        abort         → yield FinalAnswer(reason); return
+        final_answer  → yield FinalAnswer; return
+```
+
+## Install & run
 
 ```bash
 pip install -e .
 ollama pull llama3
+jarvis chat -v     # interactive REPL with full step trace + plan table
+jarvis run "..."   # one-shot
+jarvis serve       # FastAPI on :8000
+jarvis tools       # list registered tools
+python examples/basic_usage.py
 ```
 
-## Run
-
-```bash
-jarvis chat -v           # interactive REPL with step-by-step trace
-jarvis run "..."         # one-shot
-jarvis serve             # FastAPI on :8000
-jarvis tools             # list registered tools
-```
-
-## Configuration
+## Configuration (key V3 fields)
 
 `jarvis/config/default.yaml` (env override: `JARVIS_*` with `__` for nesting).
 
-Key new keys:
 ```yaml
 agent:
   max_steps: 12
   retrieve_k: 5
+  # ExecutionPolicyEngine thresholds
   max_consecutive_failures: 3
-  replan_after_failures: 2
+  max_total_failures: 8
+  max_replans: 2
+  ban_tool_after_failures: 2
+  same_tool_loop_window: 3
+  # Executor
+  tool_retry: 1
+  # Context window
   context_max_tokens: 6000
   context_keep_recent: 6
 ```
@@ -108,41 +128,28 @@ agent:
 | execute      | ask             |
 | destructive  | double_confirm  |
 
-`Executor` is the single chokepoint: every tool call passes through the
-`Approver` before running.
+The `Executor` is the single chokepoint: every tool call passes through the
+`Approver` before running, then through the per-class retry policy.
 
 ## Project layout
 
 ```
 jarvis/
 ├── core/
-│   ├── agent.py         # loop orchestrator
-│   ├── planner.py       # NEW
-│   ├── reasoner.py      # NEW
-│   ├── executor.py      # NEW
-│   ├── scratchpad.py    # NEW (structured state)
-│   ├── context.py       # NEW (token budgeting)
-│   ├── prompts.py       # split: planner/reasoner/memory
-│   ├── schemas.py       # Plan, PlanStep, ReasonerDecision, MemoryItem, ...
-│   └── orchestrator.py  # wiring
-├── llm/
-│   ├── base.py          # generate + generate_json + retry
-│   ├── ollama_provider.py
-│   └── retry.py         # NEW (JSON extraction + Pydantic validation)
-├── memory/
-│   ├── manager.py       # typed, filtered
-│   ├── classifier.py    # NEW (LLM-based gate)
-│   ├── long_term.py     # Chroma with metadata filtering
-│   ├── short_term.py
-│   └── store.py         # SQLite
-├── tools/
-│   ├── base.py          # wrapper: error capture, size limit, normalize
-│   ├── limits.py        # NEW (truncate)
-│   ├── shell.py
-│   ├── filesystem.py    # + FilePatchTool
-│   ├── python_exec.py
-│   └── registry.py
-├── safety/
+│   ├── agent.py            # V3 loop (TaskState + PolicyEngine)
+│   ├── task_state.py       # NEW: central state
+│   ├── policy_engine.py    # NEW: deterministic execution policy
+│   ├── planner.py          # dep-aware plans
+│   ├── reasoner.py         # tool_call/step_complete/final_answer/replan/abort
+│   ├── executor.py         # retry + guards + size limits
+│   ├── context.py          # token budgeting
+│   ├── prompts.py
+│   ├── schemas.py
+│   └── orchestrator.py     # wiring
+├── llm/                    # generate + generate_json + retry
+├── memory/                 # short_term, long_term, store, classifier, manager
+├── safety/                 # approver + safety policy
+├── tools/                  # base + shell/fs/python_exec + file_patch + limits
 ├── api/server.py
 ├── config/
 └── cli.py
@@ -150,9 +157,7 @@ jarvis/
 
 ## Extending
 
-- **New tool**: subclass `Tool`, implement `_execute`; register in
-  `tools/registry.py`. The base class handles error capture, size truncation,
-  and metadata normalization automatically.
-- **New LLM provider**: subclass `LLMProvider`, implement `generate`. The
-  default `generate_json` works automatically using your `generate`.
-- **New memory type**: extend the `MemoryType` enum.
+- **New tool**: subclass `Tool`, implement `_execute`; register in `tools/registry.py`. Wrapper handles error capture, size truncation, normalization.
+- **New LLM provider**: subclass `LLMProvider`, implement `generate`; `generate_json` works out of the box.
+- **New policy rule**: add a check in `ExecutionPolicyEngine.before/after`. It's deterministic Python — no LLM in the loop for safety rails.
+- **New action type**: extend the `Action.type` Literal and handle it in `Agent.stream`.
