@@ -1,17 +1,33 @@
 from jarvis.core.schemas import (
     Action,
+    AgentEvent,
     AgentStep,
+    ChatMessage,
     FinalAnswer,
+    MemoryItem,
+    MemoryType,
     Observation,
+    Plan,
+    PlanStep,
+    ReasonerDecision,
+    ScratchpadEntry,
     Thought,
     ToolCall,
 )
 
 __all__ = [
     "Action",
+    "AgentEvent",
     "AgentStep",
+    "ChatMessage",
     "FinalAnswer",
+    "MemoryItem",
+    "MemoryType",
     "Observation",
+    "Plan",
+    "PlanStep",
+    "ReasonerDecision",
+    "ScratchpadEntry",
     "Thought",
     "ToolCall",
 ]

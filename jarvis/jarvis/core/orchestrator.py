@@ -1,12 +1,17 @@
-"""Orchestrator: wires LLM, tools, memory, safety into an Agent."""
+"""Orchestrator: wires Planner, Reasoner, Executor, MemoryManager."""
 from __future__ import annotations
 
 from pathlib import Path
 
 from jarvis.config.settings import Settings, load_settings
 from jarvis.core.agent import Agent
+from jarvis.core.context import ContextManager
+from jarvis.core.executor import Executor
+from jarvis.core.planner import Planner
+from jarvis.core.reasoner import Reasoner
 from jarvis.llm.registry import build_provider
 from jarvis.logging_setup import get_logger, setup_logging
+from jarvis.memory.classifier import MemoryClassifier
 from jarvis.memory.manager import MemoryManager
 from jarvis.safety.approver import Approver, AutoApprover, CLIApprover
 from jarvis.safety.policy import PolicyEngine
@@ -30,21 +35,41 @@ class Orchestrator:
 
         self.llm = build_provider(self.settings.llm)
         self.tools: ToolRegistry = build_default_registry(self.settings.tools)
-        self.memory = MemoryManager(self.settings.memory, session_id=session_id)
+
+        classifier = MemoryClassifier(self.llm)
+        self.memory = MemoryManager(
+            self.settings.memory,
+            classifier=classifier,
+            session_id=session_id,
+        )
 
         policy = PolicyEngine(self.settings.safety)
         self.approver: Approver = approver or CLIApprover(policy=policy)
 
+        context = ContextManager(
+            max_tokens=self.settings.agent.context_max_tokens,
+            keep_recent=self.settings.agent.context_keep_recent,
+        )
+
+        self.planner = Planner(self.llm, self.tools.all(), context)
+        self.reasoner = Reasoner(self.llm, self.tools.all(), context)
+        self.executor = Executor(
+            self.tools,
+            self.approver,
+            max_consecutive_failures=self.settings.agent.max_consecutive_failures,
+        )
+
         self.agent = Agent(
-            llm=self.llm,
-            tools=self.tools,
+            planner=self.planner,
+            reasoner=self.reasoner,
+            executor=self.executor,
             memory=self.memory,
-            approver=self.approver,
             max_steps=self.settings.agent.max_steps,
             retrieve_k=self.settings.agent.retrieve_k,
+            replan_after_failures=self.settings.agent.replan_after_failures,
         )
         log.info(
-            "Jarvis ready: model=%s tools=%s session=%s",
+            "Jarvis v2 ready: model=%s tools=%s session=%s",
             self.settings.llm.model,
             self.tools.names(),
             self.memory.session_id,

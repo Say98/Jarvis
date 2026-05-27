@@ -17,7 +17,7 @@ class PythonExecTool(Tool):
     name = "python_exec"
     description = (
         "Execute a snippet of Python 3 code in an isolated subprocess. "
-        "Returns stdout/stderr. No network/filesystem sandbox; rely on safety layer."
+        "Returns stdout/stderr. Subject to safety approval."
     )
     action_class = "execute"
 
@@ -27,16 +27,11 @@ class PythonExecTool(Tool):
     def arguments_schema(self) -> dict[str, Any]:
         return {
             "type": "object",
-            "properties": {
-                "code": {
-                    "type": "string",
-                    "description": "Python source code to execute.",
-                }
-            },
+            "properties": {"code": {"type": "string"}},
             "required": ["code"],
         }
 
-    def run(self, arguments: dict[str, Any]) -> ToolResult:
+    def _execute(self, arguments: dict[str, Any]) -> ToolResult:
         code = arguments.get("code")
         if not isinstance(code, str) or not code.strip():
             return ToolResult(ok=False, error="'code' must be a non-empty string.")
@@ -57,8 +52,6 @@ class PythonExecTool(Tool):
                 return ToolResult(
                     ok=False, error=f"Execution timed out after {self.timeout}s."
                 )
-            except Exception as e:
-                return ToolResult(ok=False, error=f"{type(e).__name__}: {e}")
 
         out = proc.stdout or ""
         err = proc.stderr or ""

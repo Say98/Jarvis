@@ -1,235 +1,246 @@
-"""Agent loop: THINK → DECIDE → ACT → OBSERVE → STORE → REPEAT."""
+"""Agent loop: orchestrates Planner → Reasoner → Executor with structured state."""
 from __future__ import annotations
 
-import json
-import re
 from typing import Iterator
 
-from pydantic import ValidationError
-
-from jarvis.core.prompts import build_system_prompt
+from jarvis.core.executor import Executor
+from jarvis.core.planner import Planner
+from jarvis.core.reasoner import Reasoner
 from jarvis.core.schemas import (
     Action,
+    AgentEvent,
     AgentStep,
     ChatMessage,
     FinalAnswer,
+    MemoryType,
     Observation,
+    Plan,
+    ScratchpadEntry,
     Thought,
-    ToolCall,
 )
-from jarvis.llm.base import LLMProvider
+from jarvis.core.scratchpad import Scratchpad
+from jarvis.llm.base import LLMError
 from jarvis.logging_setup import get_logger
 from jarvis.memory.manager import MemoryManager
-from jarvis.safety.approver import Approver
-from jarvis.tools.registry import ToolRegistry
 
 log = get_logger(__name__)
 
 
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
-
-
-def _extract_json(text: str) -> str:
-    """Extract the first JSON object from a model response."""
-    text = text.strip()
-    m = _JSON_FENCE_RE.search(text)
-    if m:
-        return m.group(1)
-    # Fallback: locate first { ... } balanced span.
-    start = text.find("{")
-    if start == -1:
-        raise ValueError("No JSON object found in model output.")
-    depth = 0
-    in_str = False
-    esc = False
-    for i in range(start, len(text)):
-        c = text[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                in_str = False
-        else:
-            if c == '"':
-                in_str = True
-            elif c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start : i + 1]
-    raise ValueError("Unbalanced JSON in model output.")
-
-
-def _parse_decision(raw: str) -> tuple[Thought, Action]:
-    js = _extract_json(raw)
-    try:
-        data = json.loads(js)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON from model: {e}") from e
-
-    thought_text = data.get("thought", "")
-    action_data = data.get("action")
-    if not isinstance(action_data, dict):
-        raise ValueError("Missing 'action' object in model output.")
-
-    try:
-        if action_data.get("type") == "tool_call":
-            tc = ToolCall(**action_data["tool_call"])
-            action = Action(type="tool_call", tool_call=tc)
-        elif action_data.get("type") == "final_answer":
-            action = Action(
-                type="final_answer", final_answer=action_data.get("final_answer", "")
-            )
-        else:
-            raise ValueError(f"Unknown action type: {action_data.get('type')!r}")
-    except ValidationError as e:
-        raise ValueError(f"Action validation failed: {e}") from e
-
-    return Thought(reasoning=str(thought_text)), action
-
-
 class Agent:
-    """Tool-using agent. Stateless across `run` calls; uses MemoryManager for state."""
+    """High-level loop:
+
+      1. Planner.plan(objective)                       — once
+      2. While plan not complete and budget left:
+           a. Reasoner.decide(current_step, scratchpad)
+           b. dispatch:
+              - tool_call     → Executor.execute → append entry → continue
+              - step_complete → mark step done   → continue
+              - final_answer  → yield FinalAnswer, return
+           c. on repeated failures → Planner.replan
+      3. If budget exhausted → graceful FinalAnswer
+    """
 
     def __init__(
         self,
-        llm: LLMProvider,
-        tools: ToolRegistry,
+        planner: Planner,
+        reasoner: Reasoner,
+        executor: Executor,
         memory: MemoryManager,
-        approver: Approver,
         max_steps: int = 12,
         retrieve_k: int = 5,
+        replan_after_failures: int = 2,
     ) -> None:
-        self.llm = llm
-        self.tools = tools
+        self.planner = planner
+        self.reasoner = reasoner
+        self.executor = executor
         self.memory = memory
-        self.approver = approver
         self.max_steps = max_steps
         self.retrieve_k = retrieve_k
+        self.replan_after_failures = replan_after_failures
 
-    def _build_messages(self, user_input: str) -> list[ChatMessage]:
-        snippets = self.memory.recall(user_input, k=self.retrieve_k)
-        system = build_system_prompt(self.tools.all(), snippets)
-        msgs: list[ChatMessage] = [ChatMessage(role="system", content=system)]
-        msgs.extend(self.memory.conversation())
-        msgs.append(ChatMessage(role="user", content=user_input))
-        return msgs
+    # --------------------------------------------------------------- helpers
 
-    def _execute_tool(self, call: ToolCall) -> Observation:
-        tool = self.tools.get(call.tool)
-        if tool is None:
-            return Observation(
-                ok=False,
-                content="",
-                error=f"Unknown tool '{call.tool}'. Available: {self.tools.names()}",
-            )
+    def _recall(self, query: str) -> list[str]:
+        return self.memory.recall_texts(query, k=self.retrieve_k)
 
-        decision = self.approver.approve(tool, call)
-        if not decision.allowed:
-            return Observation(
-                ok=False,
-                content="",
-                error=f"Action denied by safety layer: {decision.reason}",
-            )
-
-        result = tool.run(call.arguments)
-        return Observation(
-            ok=result.ok,
-            content=result.content,
-            error=result.error,
-            metadata=result.metadata,
+    def _emit_step(
+        self,
+        step_idx: int,
+        plan_step_id: int | None,
+        thought: str,
+        action: Action,
+        observation: Observation | None,
+    ) -> AgentStep:
+        step = AgentStep(
+            step=step_idx,
+            plan_step_id=plan_step_id,
+            thought=Thought(reasoning=thought),
+            action=action,
+            observation=observation,
         )
+        self.memory.log_step(step)
+        return step
 
-    def stream(self, user_input: str) -> Iterator[AgentStep | FinalAnswer]:
-        """Run the agent loop, yielding each AgentStep and the FinalAnswer."""
+    # --------------------------------------------------------------- main
+
+    def stream(self, user_input: str) -> Iterator[AgentEvent]:
         self.memory.add_message(ChatMessage(role="user", content=user_input))
-        scratch: list[ChatMessage] = []
+        memory_snippets = self._recall(user_input)
 
-        for step_idx in range(1, self.max_steps + 1):
-            base = self._build_messages(user_input)
-            messages = base + scratch
+        # --- 1. PLAN ------------------------------------------------------
+        try:
+            plan: Plan = self.planner.plan(user_input, memory_snippets)
+        except LLMError as e:
+            err = f"Planner failed: {e}"
+            log.error(err)
+            yield FinalAnswer(content=err)
+            return
 
-            log.debug("Agent step %d: %d msgs", step_idx, len(messages))
-            try:
-                raw = self.llm.generate(messages)
-            except Exception as e:
-                err = f"LLM error: {type(e).__name__}: {e}"
-                step = AgentStep(
-                    step=step_idx,
-                    thought=Thought(reasoning="LLM failure"),
-                    action=Action(type="final_answer", final_answer=err),
-                    observation=Observation(ok=False, content="", error=err),
+        self.memory.log_plan(plan)
+        yield plan
+
+        scratchpad = Scratchpad()
+        step_idx = 0
+
+        # --- 2. LOOP ------------------------------------------------------
+        while step_idx < self.max_steps:
+            step_idx += 1
+
+            current = plan.current()
+            if current is None:
+                # Plan complete but no final_answer yielded → synthesize one.
+                final = self._synthesize_final(plan, scratchpad)
+                yield self._emit_step(
+                    step_idx, None, "All plan steps complete.", final, None
                 )
-                self.memory.log_step(step)
-                yield step
+                self.memory.add_message(
+                    ChatMessage(role="assistant", content=final.final_answer or "")
+                )
+                self.memory.consider(
+                    f"OBJECTIVE: {user_input}\nANSWER: {final.final_answer}",
+                    source="agent",
+                )
+                yield FinalAnswer(content=final.final_answer or "")
+                return
+
+            plan.mark(current.id, "in_progress")
+
+            try:
+                decision = self.reasoner.decide(
+                    objective=user_input,
+                    current_step=current,
+                    scratchpad_json=scratchpad.render(),
+                    memory_snippets=memory_snippets,
+                )
+            except LLMError as e:
+                err = f"Reasoner failed: {e}"
+                log.error(err)
                 yield FinalAnswer(content=err)
                 return
 
-            try:
-                thought, action = _parse_decision(raw)
-            except ValueError as e:
-                log.warning("Parse failure: %s\nRaw:\n%s", e, raw)
-                # Feed the error back to the model for self-correction.
-                scratch.append(ChatMessage(role="assistant", content=raw))
-                scratch.append(
-                    ChatMessage(
-                        role="user",
-                        content=(
-                            f"Your previous output could not be parsed: {e}. "
-                            "Reply ONLY with a single valid JSON object matching the schema."
-                        ),
-                    )
-                )
-                continue
+            action = decision.action
+            thought = decision.thought
 
+            # --- dispatch -------------------------------------------------
             if action.type == "final_answer":
-                step = AgentStep(step=step_idx, thought=thought, action=action)
-                self.memory.log_step(step)
+                step = self._emit_step(step_idx, current.id, thought, action, None)
+                yield step
                 self.memory.add_message(
                     ChatMessage(role="assistant", content=action.final_answer or "")
                 )
-                self.memory.remember(
-                    f"User asked: {user_input}\nAssistant answered: {action.final_answer}",
-                    metadata={"kind": "qa"},
+                self.memory.consider(
+                    f"OBJECTIVE: {user_input}\nANSWER: {action.final_answer}",
+                    source="agent",
                 )
-                yield step
                 yield FinalAnswer(content=action.final_answer or "")
                 return
 
-            assert action.tool_call is not None
-            observation = self._execute_tool(action.tool_call)
-            step = AgentStep(
-                step=step_idx, thought=thought, action=action, observation=observation
-            )
-            self.memory.log_step(step)
+            if action.type == "step_complete":
+                plan.mark(current.id, "done", note=action.note)
+                step = self._emit_step(step_idx, current.id, thought, action, None)
+                scratchpad.add(
+                    ScratchpadEntry(
+                        step_index=step_idx,
+                        plan_step_id=current.id,
+                        thought=thought,
+                        action=action,
+                    )
+                )
+                yield step
+                continue
 
-            # Feed the observation back into the conversation for next iteration.
-            scratch.append(ChatMessage(role="assistant", content=raw))
-            scratch.append(
-                ChatMessage(
-                    role="user",
-                    content=(
-                        f"Observation from tool '{action.tool_call.tool}' "
-                        f"(ok={observation.ok}):\n{observation.content or ''}"
-                        + (f"\nerror: {observation.error}" if observation.error else "")
-                        + "\n\nDecide your next action as JSON."
-                    ),
+            # tool_call
+            observation = self.executor.execute(action)
+            step = self._emit_step(
+                step_idx, current.id, thought, action, observation
+            )
+            scratchpad.add(
+                ScratchpadEntry(
+                    step_index=step_idx,
+                    plan_step_id=current.id,
+                    thought=thought,
+                    action=action,
+                    observation=observation,
                 )
             )
             yield step
 
-        # Exceeded max steps
+            # --- replan / abort handling ----------------------------------
+            if self.executor.should_abort():
+                log.warning("Executor abort threshold reached; replanning.")
+                try:
+                    plan = self.planner.replan(plan, scratchpad.render())
+                    self.memory.log_plan(plan)
+                    self.executor.reset_failures()
+                    yield plan
+                except LLMError as e:
+                    yield FinalAnswer(content=f"Replan failed: {e}")
+                    return
+                continue
+
+            # Soft replan trigger if a single step keeps failing.
+            if (
+                not observation.ok
+                and self.executor.consecutive_failures >= self.replan_after_failures
+            ):
+                plan.mark(current.id, "failed", note=observation.error)
+                try:
+                    plan = self.planner.replan(plan, scratchpad.render())
+                    self.memory.log_plan(plan)
+                    self.executor.reset_failures()
+                    yield plan
+                except LLMError as e:
+                    yield FinalAnswer(content=f"Replan failed: {e}")
+                    return
+
+        # --- 3. BUDGET EXHAUSTED -----------------------------------------
         msg = f"Agent stopped: exceeded max_steps={self.max_steps}."
         self.memory.add_message(ChatMessage(role="assistant", content=msg))
         yield FinalAnswer(content=msg)
 
+    # --------------------------------------------------------------- helpers
+
+    def _synthesize_final(self, plan: Plan, scratchpad: Scratchpad) -> Action:
+        """Build a fallback final answer summarizing scratchpad outputs."""
+        last_obs = next(
+            (
+                e.observation.content
+                for e in reversed(scratchpad.all())
+                if e.observation and e.observation.ok
+            ),
+            None,
+        )
+        text = (
+            f"Completed all plan steps for: {plan.objective}.\n"
+            + (f"Last result:\n{last_obs}" if last_obs else "")
+        )
+        return Action(type="final_answer", final_answer=text)
+
+    # --------------------------------------------------------------- convenience
+
     def run(self, user_input: str) -> str:
-        """Convenience: run to completion and return the final answer."""
         final = ""
-        for event in self.stream(user_input):
-            if isinstance(event, FinalAnswer):
-                final = event.content
+        for ev in self.stream(user_input):
+            if isinstance(ev, FinalAnswer):
+                final = ev.content
         return final

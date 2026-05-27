@@ -39,7 +39,7 @@ class ShellTool(Tool):
             "required": ["command"],
         }
 
-    def run(self, arguments: dict[str, Any]) -> ToolResult:
+    def _execute(self, arguments: dict[str, Any]) -> ToolResult:
         cmd = arguments.get("command")
         cwd = arguments.get("cwd")
         if not isinstance(cmd, str) or not cmd.strip():
@@ -48,7 +48,6 @@ class ShellTool(Tool):
         log.info("ShellTool executing: %s", cmd)
         try:
             if sys.platform == "win32":
-                # Use shell=True on Windows for built-ins like dir
                 proc = subprocess.run(
                     cmd,
                     shell=True,
@@ -69,8 +68,6 @@ class ShellTool(Tool):
             return ToolResult(
                 ok=False, error=f"Command timed out after {self.timeout}s."
             )
-        except Exception as e:
-            return ToolResult(ok=False, error=f"{type(e).__name__}: {e}")
 
         out = proc.stdout or ""
         err = proc.stderr or ""

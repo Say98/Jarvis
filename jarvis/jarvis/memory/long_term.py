@@ -58,21 +58,35 @@ class LongTermMemory:
         self._ensure()
         doc_id = str(uuid.uuid4())
         emb = self._embed([text])
+        meta = {k: v for k, v in (metadata or {}).items() if isinstance(v, (str, int, float, bool))}
         self._collection.add(  # type: ignore
             ids=[doc_id],
             documents=[text],
             embeddings=emb,
-            metadatas=[metadata or {}],
+            metadatas=[meta],
         )
         return doc_id
 
-    def query(self, query_text: str, k: int = 5) -> list[str]:
+    def query(
+        self,
+        query_text: str,
+        k: int = 5,
+        where: dict[str, Any] | None = None,
+    ) -> list[tuple[str, dict[str, Any], float]]:
+        """Return list of (document, metadata, distance)."""
         self._ensure()
         if self._collection.count() == 0:  # type: ignore
             return []
         emb = self._embed([query_text])
         res = self._collection.query(  # type: ignore
-            query_embeddings=emb, n_results=min(k, self._collection.count())  # type: ignore
+            query_embeddings=emb,
+            n_results=min(k, self._collection.count()),  # type: ignore
+            where=where,
         )
-        docs = res.get("documents", [[]])
-        return docs[0] if docs else []
+        docs = res.get("documents", [[]])[0]
+        metas = res.get("metadatas", [[]])[0]
+        dists = res.get("distances", [[]])[0]
+        out: list[tuple[str, dict[str, Any], float]] = []
+        for d, m, di in zip(docs, metas, dists):
+            out.append((d, dict(m or {}), float(di)))
+        return out

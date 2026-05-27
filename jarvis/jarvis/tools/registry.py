@@ -6,6 +6,7 @@ from jarvis.tools.base import Tool
 from jarvis.tools.filesystem import (
     FileDeleteTool,
     FileListTool,
+    FilePatchTool,
     FileReadTool,
     FileWriteTool,
 )
@@ -43,6 +44,7 @@ def build_default_registry(cfg: ToolsConfig) -> ToolRegistry:
         reg.register(FileReadTool(root=root))
         reg.register(FileWriteTool(root=root))
         reg.register(FileListTool(root=root))
+        reg.register(FilePatchTool(root=root))
         reg.register(FileDeleteTool(root=root))
     if cfg.python_exec.enabled:
         reg.register(PythonExecTool(timeout=cfg.python_exec.timeout))

@@ -21,6 +21,10 @@ memory:
 agent:
   max_steps: 12
   retrieve_k: 5
+  max_consecutive_failures: 3
+  replan_after_failures: 2
+  context_max_tokens: 6000
+  context_keep_recent: 6
 
 safety:
   policies:

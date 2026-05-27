@@ -35,6 +35,10 @@ class MemoryConfig(BaseModel):
 class AgentConfig(BaseModel):
     max_steps: int = 12
     retrieve_k: int = 5
+    max_consecutive_failures: int = 3
+    replan_after_failures: int = 2
+    context_max_tokens: int = 6000
+    context_keep_recent: int = 6
 
 
 PolicyLevel = Literal["auto", "ask", "double_confirm", "deny"]
