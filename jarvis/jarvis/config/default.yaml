@@ -1,0 +1,41 @@
+app:
+  name: jarvis
+  log_level: INFO
+  data_dir: .jarvis_data
+
+llm:
+  provider: ollama
+  model: llama3
+  base_url: http://localhost:11434
+  temperature: 0.2
+  max_tokens: 2048
+  request_timeout: 120
+
+memory:
+  short_term_max_messages: 30
+  long_term_collection: jarvis_longterm
+  embedding_model: all-MiniLM-L6-v2
+  sqlite_path: .jarvis_data/jarvis.db
+  chroma_path: .jarvis_data/chroma
+
+agent:
+  max_steps: 12
+  retrieve_k: 5
+
+safety:
+  policies:
+    read: auto
+    write: ask
+    execute: ask
+    destructive: double_confirm
+
+tools:
+  shell:
+    enabled: true
+    timeout: 30
+  filesystem:
+    enabled: true
+    root: "."
+  python_exec:
+    enabled: true
+    timeout: 15
