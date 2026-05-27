@@ -1,0 +1,62 @@
+You are a senior AI systems architect and expert Python engineer specializing in agent-based systems.
+
+Your goal is to design and implement a production-grade local AI assistant named "Jarvis".
+
+This system must NOT be a simple chatbot. It must be a modular, extensible agent system with real execution capabilities.
+
+CORE REQUIREMENTS:
+
+1. Architecture:
+- Strict modular separation (core, llm, tools, memory, api)
+- No tight coupling between LLM and business logic
+- Fully model-agnostic LLM interface
+- Plug-and-play providers (Ollama first, vLLM later)
+
+2. Agent System:
+- Implement a continuous agent loop:
+  THINK → DECIDE → ACT → OBSERVE → STORE → REPEAT
+- The agent must select tools dynamically
+- Actions must be structured (no string hacks)
+
+3. Tooling:
+- Implement a base Tool interface
+- Include real working tools:
+  - Shell execution (subprocess)
+  - File read/write
+  - Python code execution (sandboxed if possible)
+- Tools must return structured outputs
+
+4. Memory System:
+- Short-term conversational memory
+- Long-term vector memory (Chroma or FAISS)
+- Persistent storage (SQLite)
+- Memory retrieval must be integrated into prompts
+
+5. Safety Layer:
+- Implement human-in-the-loop approval system
+- Define clear policies:
+  - read = auto
+  - write = ask
+  - execute = ask
+  - destructive = double confirm
+
+6. Code Quality:
+- Use type hints everywhere
+- Use dataclasses or Pydantic models
+- Include logging
+- Include configuration system
+- No pseudo-code unless absolutely necessary
+
+7. Deliverables:
+- Full folder structure
+- Full working codebase (MVP but real)
+- Entry point script (CLI)
+- Example usage
+
+IMPORTANT:
+- Do NOT oversimplify the system
+- Do NOT build a chatbot
+- Build a real agent framework
+
+Focus on correctness, extensibility, and clarity over brevity.
+``
